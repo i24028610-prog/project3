@@ -1,5 +1,5 @@
 """
-Task 1 - Real Image Capture for Tetris (.exe) [FULL VERSION - Edge Based]
+Task 1 - Real Image Capture for Tetris (.exe)
 
 What it does:
 - Capture the real Tetris .exe board from screen (ROI).
@@ -7,23 +7,28 @@ What it does:
 - Record one action per frame (CSV), aligned with frames.
 - Show a GUI window and mark "landing position" (Mode A):
   per-column landing row + highlight a target column.
-
-Why this version works for your game:
-- Your blocks become GRAY after landing (low saturation / close to background).
-- So we do NOT rely on color.
-- We detect occupancy using EDGE ENERGY (Sobel magnitude), which still works
-  for gray blocks due to borders/contrast.
+- 从屏幕中捕获真实运行的俄罗斯方块 .exe 棋盘区域（ROI）。
+- 将每一帧转换为 18×14 网格并保存为 CSV（可读、可检查）。
+- 记录每一帧对应的动作（CSV），并与帧严格对齐。
+- 显示 GUI 窗口并标注“落点位置”（模式 A）：
+  计算每列落点行并高亮一个目标列。
 
 Multi-monitor + Windows scaling fixes:
 - DPI aware (reduces coordinate mismatch under scaling)
 - ROI selection uses virtual desktop (all monitors) via mss.monitors[0]
 - ROI coordinates corrected with virtual desktop left/top offset
-
+多显示器 + Windows 缩放修复：
+- DPI 感知（降低缩放导致的坐标不一致问题）
+- ROI 选择基于虚拟桌面（全部屏幕），使用 mss.monitors[0]
+- ROI 坐标使用虚拟桌面 left/top 偏移进行修正，避免多屏错位
 Controls:
 - Q: Quit
 - R: Re-select ROI (overwrite roi_config.json)
 - C: Calibrate edge threshold from current ROI (best at early game / empty board)
-
+快捷键：
+- Q：退出
+- R：重新选择 ROI（覆盖 roi_config.json）
+- C：从当前 ROI 校准边缘阈值（建议在开局/棋盘较空时执行）
 Dependencies:
 - pip install opencv-python numpy mss pynput
 """
@@ -193,6 +198,9 @@ def select_roi_interactive(capture: ScreenCapture) -> Optional[Roi]:
     cv2.selectROI returns coordinates relative to the screenshot image (0,0).
     We must add the virtual desktop origin (monitor[0] left/top) to convert
     into absolute coordinates for mss.grab.
+    cv2.selectROI 返回的坐标是相对于截图图像左上角 (0, 0) 的相对坐标。
+    因此我们必须把虚拟桌面的原点偏移（monitor[0] 的 left/top）加到该坐标上，
+    才能转换为 mss.grab 所需的屏幕绝对坐标
     """
     full_bgr, (origin_left, origin_top) = capture.grab_full_bgr()
     if full_bgr.size == 0:
@@ -342,22 +350,27 @@ class GridExtractor:
 
 
 class LandingMarker:
-    """Mode A landing: per-column landing row from occupancy grid."""
+    """Mode A landing: per-column landing row from occupancy grid (fixed)."""
 
     @staticmethod
     def compute_column_landings(grid: np.ndarray) -> List[int]:
         landings: List[int] = []
         for c in range(COLS):
+            # Default: if column is empty, it can land on the bottom row
             landing_row = ROWS - 1
-            for r in range(ROWS - 1, -1, -1):
+
+            # Find the FIRST filled cell from TOP (the highest obstacle)
+            for r in range(ROWS):
                 if grid[r, c] != 0:
                     landing_row = max(0, r - 1)
                     break
+
             landings.append(landing_row)
         return landings
 
     @staticmethod
     def choose_target_column(landings: List[int]) -> int:
+        # Choose the column with the deepest landing (largest landing_row)
         if not landings:
             return 0
         return int(np.argmax(np.array(landings, dtype=np.int32)))
@@ -404,7 +417,7 @@ class CsvRecorder:
 
 
 class Visualizer:
-    """Draw grid lines, landing markers, target column, and HUD on ROI image."""
+    """Draw only grid lines and HUD on ROI image (hide yellow dots & red box)."""
 
     def __init__(self) -> None:
         self.window_name = WINDOW_NAME
@@ -413,8 +426,8 @@ class Visualizer:
         self,
         roi_bgr: np.ndarray,
         grid: np.ndarray,
-        landings: List[int],
-        target_col: int,
+        landings: List[int],   # 保留参数，但不使用
+        target_col: int,       # 保留参数，但不使用
         energy_thresh: float,
     ) -> None:
         vis = roi_bgr.copy()
@@ -422,7 +435,7 @@ class Visualizer:
         cell_h = h / ROWS
         cell_w = w / COLS
 
-        # Grid lines
+        # Draw grid lines
         for r in range(1, ROWS):
             y = int(r * cell_h)
             cv2.line(vis, (0, y), (w, y), (90, 90, 90), 1)
@@ -430,20 +443,12 @@ class Visualizer:
             x = int(c * cell_w)
             cv2.line(vis, (x, 0), (x, h), (90, 90, 90), 1)
 
-        # Landing markers
-        for c, lr in enumerate(landings):
-            cx = int((c + 0.5) * cell_w)
-            cy = int((lr + 0.5) * cell_h)
-            cv2.circle(vis, (cx, cy), 4, (0, 255, 255), -1)
+        # Hide landing markers (yellow dots) and target column (red box)
+        # (No drawing here)
 
-        # Target column highlight
-        x0 = int(target_col * cell_w)
-        x1 = int((target_col + 1) * cell_w)
-        cv2.rectangle(vis, (x0, 0), (x1, h), (0, 0, 255), 2)
-
-        # HUD
+        # HUD text
         filled = int(np.sum(grid))
-        text = f"edge_th={energy_thresh:.1f} filled={filled}/{TOTAL_CELLS}"
+        text = f"edge_th={energy_thresh:.1f} filled={filled}/{ROWS * COLS}"
         cv2.putText(
             vis,
             text,
