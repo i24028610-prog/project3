@@ -1,34 +1,25 @@
 """
-Task 1 - Real Image Capture for Tetris (.exe)
+Task 1 - Real Image Capture for Tetris (.exe) [FINAL - Per-frame CSV + Center Patch Overlay]
 
 What it does:
 - Capture the real Tetris .exe board from screen (ROI).
-- Convert each frame into an 18x14 grid and save as CSV (human-readable).
+- Convert each frame into an 18x14 binary grid and save as CSV (one file per frame).
 - Record one action per frame (CSV), aligned with frames.
-- Show a GUI window and mark "landing position" (Mode A):
-  per-column landing row + highlight a target column.
-- 从屏幕中捕获真实运行的俄罗斯方块 .exe 棋盘区域（ROI）。
-- 将每一帧转换为 18×14 网格并保存为 CSV（可读、可检查）。
-- 记录每一帧对应的动作（CSV），并与帧严格对齐。
-- 显示 GUI 窗口并标注“落点位置”（模式 A）：
-  计算每列落点行并高亮一个目标列。
+- Show a GUI window:
+  - ROI screenshot
+  - 18x14 grid lines
+  - Outline detected occupied cells (grid==1) in green (tight to real block size)
+  - NO yellow dots, NO red target column (hidden)
 
-Multi-monitor + Windows scaling fixes:
-- DPI aware (reduces coordinate mismatch under scaling)
-- ROI selection uses virtual desktop (all monitors) via mss.monitors[0]
-- ROI coordinates corrected with virtual desktop left/top offset
-多显示器 + Windows 缩放修复：
-- DPI 感知（降低缩放导致的坐标不一致问题）
-- ROI 选择基于虚拟桌面（全部屏幕），使用 mss.monitors[0]
-- ROI 坐标使用虚拟桌面 left/top 偏移进行修正，避免多屏错位
+Output:
+- Frames: out_task1_real/frames_<tag>/frame_000000.csv, frame_000001.csv, ...
+- Actions: out_task1_real/actions_<tag>.csv
+
 Controls:
 - Q: Quit
 - R: Re-select ROI (overwrite roi_config.json)
-- C: Calibrate edge threshold from current ROI (best at early game / empty board)
-快捷键：
-- Q：退出
-- R：重新选择 ROI（覆盖 roi_config.json）
-- C：从当前 ROI 校准边缘阈值（建议在开局/棋盘较空时执行）
+- C: Calibrate background + thresholds from current ROI (best at early game / empty board)
+
 Dependencies:
 - pip install opencv-python numpy mss pynput
 """
@@ -41,7 +32,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -54,6 +45,7 @@ from pynput import keyboard
 
 ROWS = 18
 COLS = 14
+TOTAL_CELLS = ROWS * COLS
 
 FPS = 15
 FRAME_INTERVAL = 1.0 / FPS
@@ -63,7 +55,7 @@ ROI_CONFIG_PATH = OUTPUT_DIR / "roi_config.json"
 
 WINDOW_NAME = "Task1 Capture (Q quit | R reselect ROI | C calibrate)"
 
-# Actions (edit if your project uses other names)
+# Actions
 ACTION_NONE = "NONE"
 ACTION_LEFT = "LEFT"
 ACTION_RIGHT = "RIGHT"
@@ -79,8 +71,6 @@ VALID_ACTIONS = {
     ACTION_SOFT_DROP,
     ACTION_HARD_DROP,
 }
-
-TOTAL_CELLS = ROWS * COLS
 
 
 # -----------------------------
@@ -195,12 +185,9 @@ def select_roi_interactive(capture: ScreenCapture) -> Optional[Roi]:
     Select ROI on the virtual desktop screenshot.
 
     IMPORTANT:
-    cv2.selectROI returns coordinates relative to the screenshot image (0,0).
+    cv2.selectROI returns coordinates relative to screenshot image (0,0).
     We must add the virtual desktop origin (monitor[0] left/top) to convert
     into absolute coordinates for mss.grab.
-    cv2.selectROI 返回的坐标是相对于截图图像左上角 (0, 0) 的相对坐标。
-    因此我们必须把虚拟桌面的原点偏移（monitor[0] 的 left/top）加到该坐标上，
-    才能转换为 mss.grab 所需的屏幕绝对坐标
     """
     full_bgr, (origin_left, origin_top) = capture.grab_full_bgr()
     if full_bgr.size == 0:
@@ -270,36 +257,35 @@ class ActionListener:
 
 
 # -----------------------------
-# Grid extraction (edge energy)
+# Grid extraction (center patch)
 # -----------------------------
 
 
 class GridExtractor:
     """
-    Robust occupancy detection using EDGE ENERGY (Sobel magnitude).
+    Cell-center detection (tight to block size, no neighbor expansion).
 
-    This works well when landed blocks become gray and color-based methods fail.
+    For each cell, analyze ONLY a center patch (avoid borders/edges).
+    Filled if:
+      - abs(mean_gray - bg_gray) >= diff_thresh
+        OR
+      - std_gray >= std_thresh
 
-    Output grid values:
-    - 0 = empty
-    - 1 = filled
+    Press 'C' to calibrate bg_gray and thresholds from current ROI.
+    Best time: early game when the board is mostly empty.
     """
 
-    def __init__(self, energy_thresh: float = 18.0) -> None:
-        self.energy_thresh = float(energy_thresh)
-
-    @staticmethod
-    def _edge_magnitude(gray: np.ndarray) -> np.ndarray:
-        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        return cv2.magnitude(gx, gy)
+    def __init__(self) -> None:
+        self.bg_gray = 245.0
+        self.diff_thresh = 18.0
+        self.std_thresh = 10.0
+        self.center_ratio = 0.25  # use middle 50% area
 
     def bgr_to_grid(self, bgr: np.ndarray) -> np.ndarray:
         if bgr.size == 0:
             return np.zeros((ROWS, COLS), dtype=np.int8)
 
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        mag = self._edge_magnitude(gray)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
         h, w = gray.shape[:2]
         cell_h = h / ROWS
@@ -314,96 +300,106 @@ class GridExtractor:
                 x0 = int(c * cell_w)
                 x1 = int((c + 1) * cell_w)
 
-                cell_mag = mag[y0:y1, x0:x1]
-                if cell_mag.size == 0:
+                ph = int((y1 - y0) * self.center_ratio)
+                pw = int((x1 - x0) * self.center_ratio)
+
+                cy0 = y0 + ph
+                cy1 = y1 - ph
+                cx0 = x0 + pw
+                cx1 = x1 - pw
+
+                patch = gray[cy0:cy1, cx0:cx1]
+                if patch.size == 0:
                     continue
 
-                energy = float(np.mean(cell_mag))
-                grid[r, c] = 1 if energy >= self.energy_thresh else 0
+                m = float(np.mean(patch))
+                s = float(np.std(patch))
+
+                if abs(m - self.bg_gray) >= self.diff_thresh or s >= self.std_thresh:
+                    grid[r, c] = 1
 
         return grid
 
-    def calibrate_from_roi(self, roi_bgr: np.ndarray) -> float:
-        """
-        Calibrate threshold from current ROI.
-        Best time to press 'C': early game when board is mostly empty.
-
-        Method:
-        - Compute edge magnitude of ROI
-        - Use a robust percentile as background edge level
-        - Set threshold = bg_level + margin
-        """
+    def calibrate_from_roi(self, roi_bgr: np.ndarray) -> None:
+        """Calibrate bg_gray and thresholds from current ROI (mostly empty board)."""
         if roi_bgr.size == 0:
-            return self.energy_thresh
+            return
 
-        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-        mag = self._edge_magnitude(gray)
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        h, w = gray.shape[:2]
 
-        bg_level = float(np.percentile(mag, 75))
-        self.energy_thresh = float(np.clip(bg_level + 8.0, 5.0, 80.0))
-        return self.energy_thresh
+        ph = max(12, h // 12)
+        pw = max(12, w // 12)
+        coords = [
+            (0, 0),
+            (0, w - pw),
+            (h - ph, 0),
+            (h - ph, w - pw),
+            (0, w // 2 - pw // 2),
+            (h - ph, w // 2 - pw // 2),
+        ]
 
+        samples = []
+        for y, x in coords:
+            y0 = int(np.clip(y, 0, h - 1))
+            x0 = int(np.clip(x, 0, w - 1))
+            y1 = int(np.clip(y0 + ph, 0, h))
+            x1 = int(np.clip(x0 + pw, 0, w))
+            p = gray[y0:y1, x0:x1]
+            if p.size > 0:
+                samples.append(p.reshape(-1))
 
-# -----------------------------
-# Landing marker (Mode A)
-# -----------------------------
+        if not samples:
+            return
 
+        bg_pixels = np.concatenate(samples, axis=0)
+        self.bg_gray = float(np.mean(bg_pixels))
+        bg_std = float(np.std(bg_pixels))
 
-class LandingMarker:
-    """Mode A landing: per-column landing row from occupancy grid (fixed)."""
-
-    @staticmethod
-    def compute_column_landings(grid: np.ndarray) -> List[int]:
-        landings: List[int] = []
-        for c in range(COLS):
-            # Default: if column is empty, it can land on the bottom row
-            landing_row = ROWS - 1
-
-            # Find the FIRST filled cell from TOP (the highest obstacle)
-            for r in range(ROWS):
-                if grid[r, c] != 0:
-                    landing_row = max(0, r - 1)
-                    break
-
-            landings.append(landing_row)
-        return landings
-
-    @staticmethod
-    def choose_target_column(landings: List[int]) -> int:
-        # Choose the column with the deepest landing (largest landing_row)
-        if not landings:
-            return 0
-        return int(np.argmax(np.array(landings, dtype=np.int32)))
+        self.diff_thresh = float(np.clip(bg_std * 3.0 + 8.0, 10.0, 40.0))
+        self.std_thresh = float(np.clip(bg_std * 2.0 + 6.0, 6.0, 25.0))
 
 
 # -----------------------------
-# CSV recorder
+# CSV recorder (PER-FRAME)
 # -----------------------------
 
 
 class CsvRecorder:
-    """Save frames and actions to CSV (human-checkable)."""
+    """
+    Save frames as ONE CSV PER FRAME (18 rows x 14 cols),
+    and actions as a single CSV aligned by frame_idx.
+    """
 
     def __init__(self, out_dir: Path, tag: str) -> None:
-        self.frames_path = out_dir / f"frames_{tag}.csv"
+        self.out_dir = out_dir
+        self.tag = tag
+
+        # Frames directory: out_task1_real/frames_<tag>/
+        self.frames_dir = out_dir / f"frames_{tag}"
+        self.frames_dir.mkdir(parents=True, exist_ok=True)
+
+        # Actions file: out_task1_real/actions_<tag>.csv
         self.actions_path = out_dir / f"actions_{tag}.csv"
-
-        self._frames_file = open(self.frames_path, "w", newline="", encoding="utf-8")
         self._actions_file = open(self.actions_path, "w", newline="", encoding="utf-8")
-
-        self.frames_writer = csv.writer(self._frames_file)
         self.actions_writer = csv.writer(self._actions_file)
         self.actions_writer.writerow(["frame_idx", "timestamp", "action"])
 
     def close(self) -> None:
-        self._frames_file.close()
         self._actions_file.close()
 
     def write_frame(self, frame_idx: int, grid: np.ndarray) -> None:
-        self.frames_writer.writerow([f"frame={frame_idx}"])
-        for r in range(ROWS):
-            self.frames_writer.writerow(grid[r, :].tolist())
-        self.frames_writer.writerow([])
+        """
+        Write one frame to:
+          frames_<tag>/frame_000000.csv
+        Content:
+          18 rows, each with 14 values (0/1)
+        """
+        frame_path = self.frames_dir / f"frame_{frame_idx:06d}.csv"
+        with open(frame_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            for r in range(ROWS):
+                w.writerow(grid[r, :].tolist())
 
     def write_action(self, frame_idx: int, timestamp: float, action: str) -> None:
         if action not in VALID_ACTIONS:
@@ -417,7 +413,7 @@ class CsvRecorder:
 
 
 class Visualizer:
-    """Draw only grid lines and HUD on ROI image (hide yellow dots & red box)."""
+    """Show ROI with grid lines and outline detected occupied cells (grid==1)."""
 
     def __init__(self) -> None:
         self.window_name = WINDOW_NAME
@@ -426,16 +422,27 @@ class Visualizer:
         self,
         roi_bgr: np.ndarray,
         grid: np.ndarray,
-        landings: List[int],   # 保留参数，但不使用
-        target_col: int,       # 保留参数，但不使用
-        energy_thresh: float,
+        bg_gray: float,
+        diff_th: float,
+        std_th: float,
     ) -> None:
         vis = roi_bgr.copy()
         h, w = vis.shape[:2]
         cell_h = h / ROWS
         cell_w = w / COLS
 
-        # Draw grid lines
+        # Outline occupied cells (tight)
+        for r in range(ROWS):
+            for c in range(COLS):
+                if grid[r, c] == 0:
+                    continue
+                x0 = int(c * cell_w)
+                y0 = int(r * cell_h)
+                x1 = int((c + 1) * cell_w)
+                y1 = int((r + 1) * cell_h)
+                cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 255, 0), 2)
+
+        # Grid lines
         for r in range(1, ROWS):
             y = int(r * cell_h)
             cv2.line(vis, (0, y), (w, y), (90, 90, 90), 1)
@@ -443,18 +450,17 @@ class Visualizer:
             x = int(c * cell_w)
             cv2.line(vis, (x, 0), (x, h), (90, 90, 90), 1)
 
-        # Hide landing markers (yellow dots) and target column (red box)
-        # (No drawing here)
-
-        # HUD text
         filled = int(np.sum(grid))
-        text = f"edge_th={energy_thresh:.1f} filled={filled}/{ROWS * COLS}"
+        text = (
+            f"bg={bg_gray:.0f} diff={diff_th:.0f} std={std_th:.0f} "
+            f"filled={filled}/{TOTAL_CELLS}"
+        )
         cv2.putText(
             vis,
             text,
             (8, 22),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.55,
             (30, 30, 30),
             2,
             cv2.LINE_AA,
@@ -464,7 +470,7 @@ class Visualizer:
             text,
             (8, 22),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.55,
             (255, 255, 255),
             1,
             cv2.LINE_AA,
@@ -494,8 +500,7 @@ def main() -> None:
         save_roi(roi)
         print(f"ROI saved to: {ROI_CONFIG_PATH}")
 
-    extractor = GridExtractor(energy_thresh=18.0)
-    marker = LandingMarker()
+    extractor = GridExtractor()
     visualizer = Visualizer()
 
     tag = now_tag()
@@ -518,9 +523,6 @@ def main() -> None:
             roi_bgr = capture.grab_roi_bgr(roi)
             grid = extractor.bgr_to_grid(roi_bgr)
 
-            landings = marker.compute_column_landings(grid)
-            target_col = marker.choose_target_column(landings)
-
             action = actions.consume_action()
             recorder.write_frame(frame_idx, grid)
             recorder.write_action(frame_idx, now, action)
@@ -528,9 +530,9 @@ def main() -> None:
             visualizer.show(
                 roi_bgr=roi_bgr,
                 grid=grid,
-                landings=landings,
-                target_col=target_col,
-                energy_thresh=extractor.energy_thresh,
+                bg_gray=extractor.bg_gray,
+                diff_th=extractor.diff_thresh,
+                std_th=extractor.std_thresh,
             )
 
             key = cv2.waitKey(1) & 0xFF
@@ -545,8 +547,13 @@ def main() -> None:
                     print(f"ROI updated and saved to: {ROI_CONFIG_PATH}")
 
             if key in (ord("c"), ord("C")):
-                th = extractor.calibrate_from_roi(roi_bgr)
-                print(f"Calibrated edge energy threshold -> {th:.2f}")
+                extractor.calibrate_from_roi(roi_bgr)
+                print(
+                    "Calibrated: "
+                    f"bg_gray={extractor.bg_gray:.1f}, "
+                    f"diff_th={extractor.diff_thresh:.1f}, "
+                    f"std_th={extractor.std_thresh:.1f}"
+                )
 
             frame_idx += 1
 
@@ -554,7 +561,7 @@ def main() -> None:
         actions.stop()
         recorder.close()
         cv2.destroyAllWindows()
-        print(f"Saved frames CSV: {recorder.frames_path}")
+        print(f"Saved frames dir: {recorder.frames_dir}")
         print(f"Saved actions CSV: {recorder.actions_path}")
 
 
