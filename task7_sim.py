@@ -633,6 +633,9 @@ class TetrisGame:
             row=target_final_row,
             col=target_anchor_col,
         )
+        if not self.is_valid_position(final_piece):
+            return None
+
         if leftmost_col(final_piece) != target_left_col14:
             return None
 
@@ -650,66 +653,8 @@ class TetrisGame:
         )
 
     # -------------------------
-    # Motion trajectory planning
+    # 直接到目标落点，不再走过程
     # -------------------------
-    def build_horizontal_rotation_path(
-        self,
-        piece: Piece,
-        target_rotation: int,
-        target_anchor_col: int,
-    ) -> Optional[List[str]]:
-        rotation_count = len(SHAPES[piece.kind])
-        start_state = (piece.rotation % rotation_count, piece.col)
-        target_state = (target_rotation % rotation_count, target_anchor_col)
-
-        if start_state == target_state:
-            return []
-
-        queue: Deque[Tuple[int, int]] = deque([start_state])
-        parent: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {
-            start_state: None
-        }
-        action_used: Dict[Tuple[int, int], str] = {}
-
-        while queue:
-            rotation, col = queue.popleft()
-
-            candidates = [
-                ("rotate", ((rotation + 1) % rotation_count, col)),
-                ("left", (rotation, col - 1)),
-                ("right", (rotation, col + 1)),
-            ]
-
-            for action_name, next_state in candidates:
-                next_rotation, next_col = next_state
-                if next_state in parent:
-                    continue
-
-                candidate_piece = Piece(
-                    kind=piece.kind,
-                    rotation=next_rotation,
-                    row=piece.row,
-                    col=next_col,
-                )
-                if not self.is_valid_position(candidate_piece):
-                    continue
-
-                parent[next_state] = (rotation, col)
-                action_used[next_state] = action_name
-
-                if next_state == target_state:
-                    path: List[str] = []
-                    cur = next_state
-                    while parent[cur] is not None:
-                        path.append(action_used[cur])
-                        cur = parent[cur]
-                    path.reverse()
-                    return path
-
-                queue.append(next_state)
-
-        return None
-
     def plan_actions_for_current_piece(self) -> bool:
         if self.current_piece is None:
             return False
@@ -725,99 +670,40 @@ class TetrisGame:
             self.target_final_row,
         ) = move
 
-        path = self.build_horizontal_rotation_path(
-            self.current_piece,
-            self.target_rotation,
-            self.target_anchor_col,
+        final_piece = Piece(
+            kind=self.current_piece.kind,
+            rotation=self.target_rotation,
+            row=self.target_final_row,
+            col=self.target_anchor_col,
         )
-        if path is None:
+
+        if not self.is_valid_position(final_piece):
             return False
 
-        down_steps = self.target_final_row - self.current_piece.row
-        if down_steps < 0:
+        if leftmost_col(final_piece) != self.target_left_col14:
             return False
 
+        self.current_piece = final_piece
         self.action_queue.clear()
-        for action in path:
-            self.action_queue.append(action)
-
-        for _ in range(down_steps):
-            self.action_queue.append("down")
-
-        self.action_queue.append("lock")
+        self.last_action = "NN_DIRECT"
         return True
 
     def execute_one_action(self) -> None:
         if self.current_piece is None:
             return
-
-        if not self.action_queue:
-            self.last_action = "NONE"
-            return
-
-        action = self.action_queue.popleft()
-        self.last_action = action.upper()
-
-        if action == "rotate":
-            candidate = Piece(
-                kind=self.current_piece.kind,
-                rotation=self.current_piece.rotation + 1,
-                row=self.current_piece.row,
-                col=self.current_piece.col,
-            )
-            if self.is_valid_position(candidate):
-                self.current_piece = candidate
-            return
-
-        if action == "left":
-            candidate = Piece(
-                kind=self.current_piece.kind,
-                rotation=self.current_piece.rotation,
-                row=self.current_piece.row,
-                col=self.current_piece.col - 1,
-            )
-            if self.is_valid_position(candidate):
-                self.current_piece = candidate
-            return
-
-        if action == "right":
-            candidate = Piece(
-                kind=self.current_piece.kind,
-                rotation=self.current_piece.rotation,
-                row=self.current_piece.row,
-                col=self.current_piece.col + 1,
-            )
-            if self.is_valid_position(candidate):
-                self.current_piece = candidate
-            return
-
-        if action == "down":
-            candidate = Piece(
-                kind=self.current_piece.kind,
-                rotation=self.current_piece.rotation,
-                row=self.current_piece.row + 1,
-                col=self.current_piece.col,
-            )
-            if self.is_valid_position(candidate):
-                self.current_piece = candidate
-            else:
-                self.lock_piece(self.current_piece)
-            return
-
-        if action == "lock":
-            self.lock_piece(self.current_piece)
+        self.last_action = "LOCK"
+        self.lock_piece(self.current_piece)
 
     def auto_step(self) -> None:
         if self.game_over or self.current_piece is None:
             return
 
-        if self.new_piece_spawned:
-            ok = self.plan_actions_for_current_piece()
-            if not ok:
-                self.game_over = True
-                return
-            self.new_piece_spawned = False
+        ok = self.plan_actions_for_current_piece()
+        if not ok:
+            self.game_over = True
+            return
 
+        self.new_piece_spawned = False
         self.execute_one_action()
 
 
@@ -908,8 +794,6 @@ class TetrisRenderer:
 
                 pygame.draw.rect(self.screen, GRID_LINE_COLOR, cell_rect, width=1)
 
-        self.draw_motion_path(game)
-        self.draw_target_preview(game)
         self.draw_current_piece(game)
 
     def draw_current_piece(self, game: TetrisGame) -> None:
@@ -937,77 +821,6 @@ class TetrisRenderer:
                     width=2,
                     border_radius=4,
                 )
-
-    def draw_target_preview(self, game: TetrisGame) -> None:
-        if game.current_piece is None:
-            return
-        if game.target_rotation is None or game.target_anchor_col is None:
-            return
-        if game.target_final_row is None:
-            return
-
-        target_piece = Piece(
-            kind=game.current_piece.kind,
-            rotation=game.target_rotation,
-            row=game.target_final_row,
-            col=game.target_anchor_col,
-        )
-
-        for row, col in target_piece.cells():
-            if 0 <= row < BOARD_ROWS and 0 <= col < BOARD_COLS:
-                x = self.board_x + col * CELL_SIZE
-                y = self.board_y + row * CELL_SIZE
-                cell_rect = pygame.Rect(x, y, CELL_SIZE, CELL_SIZE)
-                target_rect = cell_rect.inflate(-8, -8)
-                pygame.draw.rect(
-                    self.screen,
-                    TARGET_COLOR,
-                    target_rect,
-                    width=2,
-                    border_radius=3,
-                )
-
-    def draw_motion_path(self, game: TetrisGame) -> None:
-        if game.current_piece is None:
-            return
-        if game.target_rotation is None or game.target_anchor_col is None:
-            return
-        if game.target_final_row is None:
-            return
-
-        current_cells = game.current_piece.cells()
-        target_piece = Piece(
-            kind=game.current_piece.kind,
-            rotation=game.target_rotation,
-            row=game.target_final_row,
-            col=game.target_anchor_col,
-        )
-        target_cells = target_piece.cells()
-
-        current_center = self.cells_center(current_cells)
-        target_center = self.cells_center(target_cells)
-
-        pygame.draw.line(
-            self.screen,
-            PATH_COLOR,
-            current_center,
-            target_center,
-            3,
-        )
-        pygame.draw.circle(self.screen, PATH_COLOR, current_center, 4)
-        pygame.draw.circle(self.screen, PATH_COLOR, target_center, 4)
-
-    def cells_center(self, cells: List[Tuple[int, int]]) -> Tuple[int, int]:
-        xs: List[int] = []
-        ys: List[int] = []
-
-        for row, col in cells:
-            x = self.board_x + col * CELL_SIZE + CELL_SIZE // 2
-            y = self.board_y + row * CELL_SIZE + CELL_SIZE // 2
-            xs.append(x)
-            ys.append(y)
-
-        return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
 
     def draw_side_panel(self, game: TetrisGame) -> None:
         panel_rect = pygame.Rect(
@@ -1042,7 +855,7 @@ class TetrisRenderer:
             f"Lines: {game.lines_cleared_total}",
             f"Pieces: {game.pieces_placed}",
             f"Board: {BOARD_ROWS}x{BOARD_COLS}",
-            f"Mode: NN + legal mask",
+            f"Mode: NN direct lock",
             "",
             f"Current kind: {cur_kind}",
             f"Current rot4: {cur_rot4}",
@@ -1125,7 +938,7 @@ class TetrisRenderer:
             "R: 重开",
             "P: 暂停/继续",
             "ESC: 退出",
-            "Task3 NN = 先推理最终落点，再分步执行",
+            "Task3 NN = 直接推理最终落点并锁定",
         ]
         text = "    |    ".join(hints)
         self.screen.blit(
@@ -1185,6 +998,7 @@ def main() -> None:
     print("       - target col = left_col14")
     print("       - legal mask applied before argmax")
     print("       - control layer uses anchor_col converted from left_col14")
+    print("       - direct mode: piece jumps to final target and locks immediately")
 
     while True:
         dt = clock.tick(FPS)
